@@ -95,6 +95,12 @@ The workbench supports a complete protocol lifecycle:
    node app/examples/generate-governance.js   # Example usage (see docs/governance-generator.md)
    ```
 
+### Telemetry Guardrails
+
+- Run `npm run cli -- perf:report` (alias: `npm run perf:report`) to read live p50/p95/p99 metrics from `artifacts/perf/*.jsonl`; the command exits non-zero if telemetry is stale or budgets are breached.
+- CI jobs call `npm run perf:budget` to enforce the same thresholds before merge, ensuring regressions surface immediately.
+- Review the full narrative in `docs/workbench-telemetry.md` for data flow, guardrails, and dashboard integration.
+
 ### Supported Communication: Agent-to-Agent (A2A)
 
 **Status**: Production-ready for local agent communication
@@ -302,6 +308,7 @@ For detailed security policies and best practices, see [`docs/security/SECURITY_
 
 - **Getting Started**: [`docs/Getting_Started.md`](docs/Getting_Started.md) – Secure setup + reproducible walkthrough
 - **Quickstart Cheatsheet**: [`docs/quickstart.md`](docs/quickstart.md) – Command-forward summary
+- **Workbench Telemetry**: [`docs/workbench-telemetry.md`](docs/workbench-telemetry.md) – How metrics and guardrails keep manifests trustworthy
 - **Security Policies**: [`docs/security/SECURITY_POLICIES.md`](docs/security/SECURITY_POLICIES.md) – Required configuration and audit notes
 - **Trimmed Surfaces (S21.2)**: [`docs/SPRINT_21_SURFACE_CHANGES.md`](docs/SPRINT_21_SURFACE_CHANGES.md) – Runtime/viewer changes and disabled surfaces
 - **Adapter Development**: [`docs/dev/`](docs/dev/) – Build custom importers
@@ -311,10 +318,13 @@ For detailed security policies and best practices, see [`docs/security/SECURITY_
 ## ✅ Test Coverage
 
 <!-- TEST-COUNTS:BEGIN -->
-Suites: 133 passed / 0 failed / 134 total
-Tests: 2068 passed / 0 failed / 2070 total
-Coverage: statements 39.73% · functions 41.55% · branches 31.53% · lines 49.18%
-Thresholds met: false
+- Updated: 2025-10-26T19:42:47.835Z
+- Test suites: 158 total (passed 157, failed 0, pending 1)
+- Tests: 2432 total (passed 2430, failed 0, skipped 2, todo 0)
+- Coverage (statements): 89.9% (652/725)
+- Coverage (functions): 92.8% (91/98)
+- Coverage (branches): 76.4% (456/597)
+- Coverage (lines): 91.1% (622/683)
 <!-- TEST-COUNTS:END -->
 
 **Test Suite Status**: 
@@ -481,7 +491,7 @@ MIT License - See LICENSE file for details
 - **Visual Exploration**: Web viewer for browsing catalogs and dependency graphs
 - **Governance Automation**: Generate compliance docs from imported specs
 - **Extensible**: Adapter system for custom import sources
-- **Truthful Telemetry**: Performance metrics from real operations (no seeded data)
+- **Truthful Telemetry**: Performance metrics from real operations (no seeded data) — see [`docs/workbench-telemetry.md`](docs/workbench-telemetry.md)
 
 ## 🔧 Runtime Integration
 
