@@ -21,6 +21,8 @@ export class PerformanceMetrics extends EventEmitter {
   constructor(options = {}) {
     super();
     this.enableLogging = options.enableLogging !== false;
+    this.memoryMonitorInterval = options.memoryMonitorInterval ?? 5000;
+    this.logger = options.logger || null;
     this.metrics = {
       requests: {
         total: 0,
@@ -68,7 +70,11 @@ export class PerformanceMetrics extends EventEmitter {
     };
     
     this.startTime = Date.now();
-    this.updateInterval = setInterval(() => this.updateMemoryMetrics(), 5000);
+    if (this.memoryMonitorInterval > 0) {
+      this.updateInterval = setInterval(() => this.updateMemoryMetrics(), this.memoryMonitorInterval);
+    } else {
+      this.updateInterval = null;
+    }
   }
 
   /**
@@ -112,8 +118,13 @@ export class PerformanceMetrics extends EventEmitter {
       this.updatePercentiles(this.metrics.mcp.latency);
     }
 
-    if (this.enableLogging) {
-      console.debug(`[Performance] ${operation}: ${latency}ms ${success ? 'success' : 'failed'} ${cached ? 'cached' : ''}`);
+    if (this.enableLogging && this.logger) {
+      this.logger.debug('Recorded request sample', {
+        operation,
+        latency,
+        success,
+        cached
+      });
     }
   }
 
@@ -239,6 +250,7 @@ export class PerformanceMetrics extends EventEmitter {
   destroy() {
     if (this.updateInterval) {
       clearInterval(this.updateInterval);
+      this.updateInterval = null;
     }
   }
 }
@@ -251,15 +263,22 @@ export class OptimizedURNResolver {
     this.cacheTtl = options.cacheTtl || 300000; // 5 minutes
     this.maxCacheSize = options.maxCacheSize || 1000;
     this.enableLogging = options.enableLogging !== false;
+    this.logger = options.logger || null;
+    this.baseResolverOptions = this._buildBaseResolverOptions(options);
     
     // Enhanced caching with TTL and LRU eviction
     this.cache = new Map();
     this.cacheTimestamps = new Map();
     this.cacheAccessOrder = new Map();
     this.accessCounter = 0;
+    this.baseResolverPromise = null;
     
     // Performance metrics
-    this.metrics = new PerformanceMetrics({ enableLogging: this.enableLogging });
+    this.metrics = new PerformanceMetrics({ 
+      enableLogging: this.enableLogging,
+      memoryMonitorInterval: options.memoryMonitorInterval,
+      logger: this.logger ? this.logger.child('metrics') : null
+    });
     
     // Pre-warm cache with common URNs
     this.preWarmCache();
@@ -275,16 +294,42 @@ export class OptimizedURNResolver {
       'urn:agent:system:validation@1.0.0'
     ];
     
-    commonURNs.forEach(urn => {
-      this.cache.set(urn, {
-        metadata: { urn, name: urn.split(':')[3], version: '1.0.0' },
-        capabilities: {},
-        cached: true,
-        resolvedAt: new Date().toISOString()
+    for (const urn of commonURNs) {
+      this.resolveAgentUrn(urn).catch(error => {
+        if (this.enableLogging && this.logger) {
+          this.logger.warn('Pre-warm failed', { urn, error });
+        }
       });
-      this.cacheTimestamps.set(urn, Date.now());
-      this.cacheAccessOrder.set(urn, this.accessCounter++);
-    });
+    }
+  }
+
+  /**
+   * Build configuration for the underlying resolver
+   * @param {Object} options
+   * @returns {Object}
+   */
+  _buildBaseResolverOptions(options = {}) {
+    const resolverOptions = { enableLogging: options.enableLogging !== false };
+    const passthrough = ['cacheTtl', 'maxRetries', 'retryDelay', 'retryBackoff'];
+    for (const key of passthrough) {
+      if (options[key] !== undefined) {
+        resolverOptions[key] = options[key];
+      }
+    }
+    return resolverOptions;
+  }
+
+  /**
+   * Lazily load the full URN resolver used for capability enrichment
+   * @returns {Promise<import('../../runtime/urn-resolver.js').URNResolver>}
+   */
+  async _getBaseResolver() {
+    if (!this.baseResolverPromise) {
+      this.baseResolverPromise = import('../../runtime/urn-resolver.js').then(({ createURNResolver }) =>
+        createURNResolver(this.baseResolverOptions)
+      );
+    }
+    return this.baseResolverPromise;
   }
 
   /**
@@ -400,13 +445,11 @@ export class OptimizedURNResolver {
    * @returns {Promise<Object>} Resolution result
    */
   async resolveWithRetry(urn) {
-    // Simplified resolution for performance optimization
-    // In a real implementation, this would call the actual URN resolver
+    const resolver = await this._getBaseResolver();
+    const result = await resolver.resolveAgentUrn(urn, { useCache: false });
     return {
-      metadata: { urn, name: urn.split(':')[3] || 'unknown', version: '1.0.0' },
-      capabilities: {},
-      cached: false,
-      resolvedAt: new Date().toISOString()
+      ...result,
+      cached: false
     };
   }
 
@@ -439,13 +482,17 @@ export class OptimizedProtocolGraph {
   constructor(options = {}) {
     this.cacheSize = options.cacheSize || 1000;
     this.enableLogging = options.enableLogging !== false;
+    this.logger = options.logger || null;
     
     // Enhanced caching
     this.cache = new Map();
     this.cacheTimestamps = new Map();
     
     // Performance metrics
-    this.metrics = new PerformanceMetrics({ enableLogging: this.enableLogging });
+    this.metrics = new PerformanceMetrics({ 
+      enableLogging: this.enableLogging,
+      logger: this.logger ? this.logger.child('metrics') : null
+    });
     
     // Graph data structures
     this.nodes = new Map();
@@ -481,8 +528,12 @@ export class OptimizedProtocolGraph {
     const latency = performance.now() - startTime;
     this.metrics.recordRequest('mcp', latency, true, false);
 
-    if (this.enableLogging) {
-      console.debug(`[ProtocolGraph] Batch added ${results.added} nodes in ${latency.toFixed(2)}ms`);
+    if (this.enableLogging && this.logger) {
+      this.logger.debug('Batch add nodes completed', {
+        added: results.added,
+        skipped: results.skipped,
+        latency
+      });
     }
 
     return results;
@@ -584,6 +635,7 @@ export class RequestBatcher {
     this.batchSize = options.batchSize || 10;
     this.batchTimeout = options.batchTimeout || 100; // 100ms
     this.enableLogging = options.enableLogging !== false;
+    this.logger = options.logger || null;
     
     this.pendingRequests = new Map();
     this.batchTimer = null;
@@ -640,8 +692,11 @@ export class RequestBatcher {
       });
 
       const latency = performance.now() - startTime;
-      if (this.enableLogging) {
-        console.debug(`[RequestBatcher] Processed ${requests.length} requests in ${latency.toFixed(2)}ms`);
+      if (this.enableLogging && this.logger) {
+        this.logger.debug('Processed request batch', {
+          size: requests.length,
+          latency
+        });
       }
     } catch (error) {
       // Reject all pending requests
@@ -658,6 +713,7 @@ export class MemoryOptimizer {
     this.maxHeapMB = options.maxHeapMB || 100;
     this.gcThreshold = options.gcThreshold || 0.8; // 80% of max
     this.enableLogging = options.enableLogging !== false;
+    this.logger = options.logger || null;
     
     this.monitorInterval = setInterval(() => this.monitorMemory(), 10000); // Every 10s
   }
@@ -670,8 +726,11 @@ export class MemoryOptimizer {
     const heapMB = memUsage.heapUsed / 1024 / 1024;
     
     if (heapMB > this.maxHeapMB * this.gcThreshold) {
-      if (this.enableLogging) {
-        console.warn(`[MemoryOptimizer] High memory usage: ${heapMB.toFixed(2)}MB (threshold: ${this.maxHeapMB * this.gcThreshold}MB)`);
+      if (this.enableLogging && this.logger) {
+        this.logger.warn('High memory usage detected', {
+          heapMB,
+          threshold: this.maxHeapMB * this.gcThreshold
+        });
       }
       
       // Force garbage collection if available
@@ -680,8 +739,10 @@ export class MemoryOptimizer {
         const newMemUsage = process.memoryUsage();
         const newHeapMB = newMemUsage.heapUsed / 1024 / 1024;
         
-        if (this.enableLogging) {
-          console.info(`[MemoryOptimizer] GC freed ${(heapMB - newHeapMB).toFixed(2)}MB`);
+        if (this.enableLogging && this.logger) {
+          this.logger.info('Garbage collection freed memory', {
+            freedMB: heapMB - newHeapMB
+          });
         }
       }
     }
@@ -721,13 +782,39 @@ export class MemoryOptimizer {
 export class PerformanceOptimizer {
   constructor(options = {}) {
     this.enableLogging = options.enableLogging !== false;
+    this.logger = options.logger || null;
+    const baseOptions = { ...options };
     
     // Initialize optimization components
-    this.urnResolver = new OptimizedURNResolver(options);
-    this.protocolGraph = new OptimizedProtocolGraph(options);
-    this.requestBatcher = new RequestBatcher(options);
-    this.memoryOptimizer = new MemoryOptimizer(options);
-    this.metrics = new PerformanceMetrics(options);
+    const urnResolverOptions = { ...baseOptions };
+    if (this.logger) {
+      urnResolverOptions.logger = this.logger.child('urn-resolver');
+    }
+    this.urnResolver = new OptimizedURNResolver(urnResolverOptions);
+
+    const protocolGraphOptions = { ...baseOptions };
+    if (this.logger) {
+      protocolGraphOptions.logger = this.logger.child('protocol-graph');
+    }
+    this.protocolGraph = new OptimizedProtocolGraph(protocolGraphOptions);
+
+    const batcherOptions = { ...baseOptions };
+    if (this.logger) {
+      batcherOptions.logger = this.logger.child('request-batcher');
+    }
+    this.requestBatcher = new RequestBatcher(batcherOptions);
+
+    const memoryOptimizerOptions = { ...baseOptions };
+    if (this.logger) {
+      memoryOptimizerOptions.logger = this.logger.child('memory');
+    }
+    this.memoryOptimizer = new MemoryOptimizer(memoryOptimizerOptions);
+
+    const metricsOptions = { ...baseOptions };
+    if (this.logger) {
+      metricsOptions.logger = this.logger.child('metrics');
+    }
+    this.metrics = new PerformanceMetrics(metricsOptions);
     
     // Performance targets
     this.targets = {
