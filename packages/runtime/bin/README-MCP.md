@@ -42,6 +42,16 @@ This MCP (Model Context Protocol) server wraps the protocol discovery tooling fo
   - `file_path`: Path to local OpenAPI specification file
   - Returns: Complete API protocol manifest with URNs, endpoints, schemas, and patterns
   
+- **protocol_discover_asyncapi** - Discover and import Event Protocol manifests from AsyncAPI specifications
+  - `file_path`: Path to local AsyncAPI specification file (JSON or YAML)
+  - `url`: HTTP(S) URL to AsyncAPI specification
+  - Returns: Event Protocol manifest with channel metadata, delivery bindings, and PII detections
+  
+- **protocol_discover_data** - Discover and import Data Protocol manifests from PostgreSQL schemas
+  - `connection_string`: PostgreSQL connection string (`postgresql://user:pass@host:port/db`)
+  - `target_schema` _(optional)_: Limit discovery to a single schema
+  - Returns: Data Protocol manifest matching CLI discovery output with sanitized connection metadata (credentials redacted)
+
 - **protocol_list_test_files** - List available OpenAPI test files in seeds directory
   - Returns: Array of test OpenAPI specifications for validation
   

@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import { createStdioServer } from './mcp/shim.js';
 import { performance } from 'perf_hooks';
+import { randomUUID } from 'crypto';
 
 // Import ES modules
 import { runTool, runWorkflow } from '../src/agents/runtime.js';
@@ -29,6 +30,8 @@ import { createStructuredLogger } from '../services/mcp-server/logger.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const { OpenAPIImporter } = require('../importers/openapi/importer.js');
+const { importAsyncAPI } = require('../importers/asyncapi/importer.js');
+const { PostgresImporter } = require('../importers/postgres/importer.js');
 
 // Implementations use real importers/validators/graph
 
@@ -116,6 +119,43 @@ const safe = (p) => {
   }
   return abs;
 };
+
+const SENSITIVE_QUERY_KEYS = new Set(['password', 'pass', 'pwd', 'secret', 'access_token', 'auth', 'key']);
+
+function sanitizeConnectionString(connectionString) {
+  if (typeof connectionString !== 'string') {
+    return '';
+  }
+
+  const trimmed = connectionString.trim();
+  if (trimmed === '') {
+    return '';
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    parsed.username = parsed.username ? '***' : '';
+    parsed.password = parsed.password ? '***' : '';
+
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (SENSITIVE_QUERY_KEYS.has(key.toLowerCase())) {
+        parsed.searchParams.set(key, '***');
+      }
+    }
+
+    return parsed.toString();
+  } catch {
+    return trimmed.replace(/\/\/([^/@:]+)(?::[^@/?#]*)?@/, '//***@');
+  }
+}
+
+function sanitizeSensitiveValue(value, original, sanitized) {
+  if (typeof value !== 'string' || !original) {
+    return value;
+  }
+
+  return value.split(original).join(sanitized);
+}
 
 function startMetricsFileWriter({ metricsEndpoint, metricsLogger, filePath, intervalMs }) {
   let writing = false;
@@ -346,6 +386,254 @@ const tools = [
           error: error.message,
           file_path,
           details: error.stack
+        };
+      }
+    })
+  },
+
+  {
+    name: 'protocol_discover_asyncapi',
+    description: 'Discover and import Event Protocol manifests from AsyncAPI specifications',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: {
+          type: 'string',
+          description: 'Path to local AsyncAPI specification file (JSON or YAML)'
+        },
+        url: {
+          type: 'string',
+          format: 'uri',
+          description: 'HTTP(S) URL to AsyncAPI specification'
+        }
+      },
+      anyOf: [
+        { required: ['file_path'] },
+        { required: ['url'] }
+      ],
+      additionalProperties: false
+    },
+    handler: withPerformanceTracking('protocol_discover_asyncapi', 'discovery', async ({ file_path, url }) => {
+      const targetUrl = typeof url === 'string' ? url.trim() : '';
+      const targetPath = typeof file_path === 'string' ? file_path.trim() : '';
+
+      if (!targetUrl && !targetPath) {
+        return {
+          success: false,
+          error: 'Either url or file_path is required'
+        };
+      }
+
+      if (targetUrl && targetPath) {
+        return {
+          success: false,
+          error: 'Provide only one of url or file_path'
+        };
+      }
+
+      const location = targetUrl ? { url: targetUrl } : { file_path: targetPath };
+      const locationLabel = targetUrl || targetPath;
+      let sourceToImport;
+      let cleanupPath = null;
+
+      if (targetUrl) {
+        const fetchFn = globalThis.fetch;
+        if (typeof fetchFn !== 'function') {
+          return {
+            success: false,
+            error: 'Fetch API not available to retrieve AsyncAPI specification',
+            ...location
+          };
+        }
+        try {
+          const response = await fetchFn(targetUrl);
+          if (!response.ok) {
+            return {
+              success: false,
+              error: `Failed to fetch AsyncAPI specification (status ${response.status})`,
+              status: response.status,
+              ...location
+            };
+          }
+          const body = await response.text();
+          const remoteDir = path.join(ROOT, '.tmp', 'asyncapi-cache');
+          await fs.mkdir(remoteDir, { recursive: true });
+
+          let extension = '.yaml';
+          try {
+            const pathname = new URL(targetUrl).pathname.toLowerCase();
+            if (pathname.endsWith('.json')) {
+              extension = '.json';
+            } else if (pathname.endsWith('.yml') || pathname.endsWith('.yaml')) {
+              extension = '.yaml';
+            }
+          } catch {
+            // Ignore URL parsing issues; fall back to content-type detection
+          }
+          const contentType = response.headers.get('content-type') || '';
+          if (contentType.includes('json')) {
+            extension = '.json';
+          }
+
+          const tempPath = path.join(remoteDir, `${randomUUID()}${extension}`);
+          await fs.writeFile(tempPath, body, 'utf8');
+          sourceToImport = tempPath;
+          cleanupPath = tempPath;
+        } catch (error) {
+          return {
+            success: false,
+            error: `Failed to fetch AsyncAPI specification: ${error.message}`,
+            ...location,
+            details: error.stack
+          };
+        }
+      } else {
+        sourceToImport = safe(targetPath);
+      }
+
+      try {
+        const { manifests, metadata } = await importAsyncAPI(sourceToImport, {
+          timeout: 30000,
+          logger: toolLogger.child('protocol_discover_asyncapi')
+        });
+
+        if (!manifests || manifests.length === 0) {
+          return {
+            success: false,
+            error: 'Discovery failed - no event manifests returned',
+            metadata,
+            ...location
+          };
+        }
+
+        const manifest = { ...manifests[0] };
+        manifest.metadata = {
+          ...(manifest.metadata || {}),
+          channel_count: metadata?.channel_count,
+          message_count: metadata?.message_count,
+          parse_time_ms: metadata?.parse_time_ms
+        };
+
+        if (manifest.metadata?.status === 'error') {
+          return {
+            success: false,
+            error: manifest.metadata?.error?.message || 'Discovery failed',
+            manifest,
+            metadata,
+            ...location
+          };
+        }
+
+        return {
+          success: true,
+          manifest,
+          metadata,
+          message: `Successfully discovered AsyncAPI from ${locationLabel}`,
+          ...location
+        };
+      } catch (error) {
+        return {
+          success: false,
+          error: error.message,
+          ...location,
+          details: error.stack
+        };
+      } finally {
+        if (cleanupPath) {
+          await fs.unlink(cleanupPath).catch(() => {});
+        }
+      }
+    })
+  },
+
+  {
+    name: 'protocol_discover_data',
+    description: 'Discover and import Data Protocol manifests from PostgreSQL schemas',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        connection_string: {
+          type: 'string',
+          description: 'PostgreSQL connection string (postgresql://user:pass@host:port/db)'
+        },
+        target_schema: {
+          type: 'string',
+          description: 'Optional schema name to restrict discovery'
+        }
+      },
+      required: ['connection_string'],
+      additionalProperties: false
+    },
+    handler: withPerformanceTracking('protocol_discover_data', 'discovery', async ({ connection_string, target_schema }) => {
+      const rawConnection = typeof connection_string === 'string' ? connection_string.trim() : '';
+      const rawSchema = typeof target_schema === 'string' ? target_schema.trim() : '';
+
+      if (!rawConnection) {
+        return {
+          success: false,
+          error: 'connection_string is required'
+        };
+      }
+
+      const sanitizedConnection = sanitizeConnectionString(rawConnection);
+      const schemaContext = rawSchema ? { target_schema: rawSchema } : {};
+
+      try {
+        const importer = new PostgresImporter({
+          readOnly: true,
+          sampleData: true,
+          includePerformance: true,
+          generateURNs: true
+        });
+
+        const manifest = await importer.import(rawConnection, rawSchema || undefined);
+
+        if (!manifest) {
+          return {
+            success: false,
+            error: 'Discovery failed - no manifest returned',
+            connection: sanitizedConnection,
+            ...schemaContext
+          };
+        }
+
+        if (manifest?.metadata?.status === 'error') {
+          return {
+            success: false,
+            error: manifest.metadata?.error?.message || 'Discovery failed',
+            connection: sanitizedConnection,
+            manifest,
+            ...schemaContext
+          };
+        }
+
+        return {
+          success: true,
+          manifest,
+          connection: sanitizedConnection,
+          message: rawSchema
+            ? `Successfully discovered schema '${rawSchema}' from PostgreSQL connection`
+            : 'Successfully discovered PostgreSQL database schema',
+          ...schemaContext
+        };
+      } catch (error) {
+        const sanitizedMessage = sanitizeSensitiveValue(
+          error?.message || 'PostgreSQL discovery failed',
+          rawConnection,
+          sanitizedConnection
+        );
+        const sanitizedDetails = sanitizeSensitiveValue(
+          error?.stack,
+          rawConnection,
+          sanitizedConnection
+        );
+
+        return {
+          success: false,
+          error: sanitizedMessage,
+          connection: sanitizedConnection,
+          ...schemaContext,
+          ...(sanitizedDetails ? { details: sanitizedDetails } : {})
         };
       }
     })
